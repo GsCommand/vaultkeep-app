@@ -1,4 +1,1216 @@
-{
+import React, { useState, useEffect, useCallback } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Notifications from 'expo-notifications';
+import {
+  View, Text, ScrollView, TouchableOpacity, TextInput,
+  StyleSheet, SafeAreaView, StatusBar, Modal, Alert, Platform, Linking,
+} from 'react-native';
+
+// ── NOTIFICATIONS SETUP ───────────────────────────────────
+
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldPlaySound: true,
+    shouldSetBadge: true,
+  }),
+});
+
+const ALERT_DAYS = [30, 14, 7, 1];
+
+async function requestNotificationPermission() {
+  const { status: existing } = await Notifications.getPermissionsAsync();
+  if (existing === 'granted') return true;
+  const { status } = await Notifications.requestPermissionsAsync();
+  if (status === 'granted') return true;
+  // Denied — offer to open settings
+  Alert.alert(
+    'Notifications blocked',
+    'VaultKeep needs notification permission to send warranty expiry reminders. Enable it in Settings.',
+    [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Open Settings', onPress: () => Linking.openSettings() },
+    ]
+  );
+  return false;
+}
+
+async function scheduleWarrantyAlerts(item, alertPrefs = {}) {
+  // Cancel any existing alerts for this item first
+  await cancelWarrantyAlerts(item.id);
+
+  const granted = await requestNotificationPermission();
+  if (!granted) return;
+
+  const expiry = new Date(item.warrantyExpiration);
+
+  for (const days of ALERT_DAYS) {
+    // Skip if user has toggled this alert off
+    const prefKey = `d${days}`;
+    if (alertPrefs[prefKey] === false) continue;
+
+    const triggerDate = new Date(expiry);
+    triggerDate.setDate(triggerDate.getDate() - days);
+    triggerDate.setHours(9, 0, 0, 0); // 9:00 AM
+
+    // Only schedule if trigger is in the future
+    if (triggerDate <= new Date()) continue;
+
+    const body = days === 1
+      ? `${item.name} warranty expires tomorrow!`
+      : days <= 7
+      ? `${item.name} warranty expires in ${days} days`
+      : `${item.name} warranty expires in ${days} days — check your coverage`;
+
+    await Notifications.scheduleNotificationAsync({
+      identifier: `${item.id}_${days}d`,
+      content: {
+        title: days <= 7 ? '⚠️ Warranty expiring soon' : '📋 Warranty reminder',
+        body,
+        data: { itemId: item.id },
+        sound: true,
+      },
+      trigger: {
+        date: triggerDate,
+      },
+    });
+  }
+}
+
+async function cancelWarrantyAlerts(itemId) {
+  for (const days of ALERT_DAYS) {
+    try {
+      await Notifications.cancelScheduledNotificationAsync(`${itemId}_${days}d`);
+    } catch {}
+  }
+}
+
+async function rescheduleAllAlerts(items, alertPrefs) {
+  for (const item of items) {
+    await scheduleWarrantyAlerts(item, alertPrefs);
+  }
+}
+
+const C = {
+  bg: '#F5F5F7',
+  surface: '#FFFFFF',
+  deep: '#F0F0F2',
+  teal: '#0DBFB0',
+  gold: '#F5C842',
+  white: '#FFFFFF',
+  text: '#111111',
+  textSub: '#6B6B6B',
+  textFaint: '#BBBBBB',
+  border: 'rgba(0,0,0,0.08)',
+  red: '#E24B4A',
+  orange: '#EF9F27',
+  green: '#1D9E75',
+};
+
+const CATEGORIES = ['Appliance','Electronics','HVAC','Plumbing','Roofing','Flooring','Furniture','Vehicle','Tools','Other'];
+
+function daysUntil(iso) {
+  return Math.ceil((new Date(iso) - new Date()) / 86400000);
+}
+function statusColor(days) {
+  if (days < 0) return C.red;
+  if (days <= 7) return C.red;
+  if (days <= 14) return C.orange;
+  if (days <= 30) return C.gold;
+  return C.green;
+}
+function expiryLabel(days) {
+  if (days < 0) return `Expired ${Math.abs(days)}d ago`;
+  if (days === 0) return 'Expires today';
+  if (days === 1) return 'Expires tomorrow';
+  if (days <= 30) return `Expires in ${days} days`;
+  return `${Math.floor(days / 30)} months left`;
+}
+function formatDate(iso) {
+  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+const SAMPLE_DOCS = {
+  '1': [
+    { id: 'd1', type: 'receipt', name: 'Purchase Receipt', store: 'Home Depot', date: '2022-03-14', size: '284 KB' },
+    { id: 'd2', type: 'warranty', name: 'Warranty Card', store: 'Samsung', date: '2022-03-14', size: '1.2 MB' },
+    { id: 'd3', type: 'manual', name: 'Owner Manual', store: 'Samsung', date: '2022-03-14', size: '8.4 MB' },
+  ],
+  '2': [
+    { id: 'd4', type: 'receipt', name: 'Installation Invoice', store: 'ARS Rescue Rooter', date: '2023-01-10', size: '512 KB' },
+    { id: 'd5', type: 'warranty', name: 'Lennox Warranty', store: 'Lennox', date: '2023-01-10', size: '2.1 MB' },
+  ],
+  '4': [
+    { id: 'd6', type: 'receipt', name: 'Roofing Invoice', store: 'All American Roofing', date: '2021-06-15', size: '640 KB' },
+    { id: 'd7', type: 'warranty', name: 'GAF Shingle Warranty', store: 'GAF', date: '2021-06-15', size: '3.3 MB' },
+  ],
+};
+
+const DOC_ICONS = {
+  receipt: { emoji: '🧾', color: '#E8F5E9', border: '#A5D6A7', label: 'Receipt' },
+  warranty: { emoji: '📋', color: '#E3F2FD', border: '#90CAF9', label: 'Warranty' },
+  manual:   { emoji: '📖', color: '#FFF3E0', border: '#FFCC80', label: 'Manual' },
+  photo:    { emoji: '📷', color: '#F3E5F5', border: '#CE93D8', label: 'Photo' },
+};
+
+const SAMPLE_ITEMS = [
+  { id: '1', name: 'Samsung Washer WF45', category: 'Appliance', retailer: 'Home Depot', purchasePrice: 899, purchaseDate: '2022-03-14', warrantyExpiration: '2025-04-21', contractorName: "Jake's Appliance Repair", contractorPhone: '(904) 555-0183', contractorEmail: 'jake@appliancerepair.com', notes: 'Extended warranty through Home Depot Protection Plan.' },
+  { id: '2', name: 'Lennox HVAC Unit', category: 'HVAC', retailer: 'ARS Rescue Rooter', purchasePrice: 4200, purchaseDate: '2023-01-10', warrantyExpiration: '2029-01-10', contractorName: '', contractorPhone: '', contractorEmail: '', notes: '' },
+  { id: '3', name: 'LG Refrigerator', category: 'Appliance', retailer: 'Best Buy', purchasePrice: 1299, purchaseDate: '2022-08-01', warrantyExpiration: '2027-08-01', contractorName: '', contractorPhone: '', contractorEmail: '', notes: '' },
+  { id: '4', name: 'Roof — GAF Timberline', category: 'Roofing', retailer: 'All American Roofing', purchasePrice: 12500, purchaseDate: '2021-06-15', warrantyExpiration: '2046-06-15', contractorName: 'All American Roofing', contractorPhone: '(904) 555-9021', contractorEmail: '', notes: '25-year shingle warranty.' },
+];
+
+// ── LIST ──────────────────────────────────────────────────
+
+function ListScreen({ items, onAdd, onSelect, onSettings }) {
+  const [search, setSearch] = useState('');
+  const filtered = items.filter(i =>
+    !search || i.name.toLowerCase().includes(search.toLowerCase()) ||
+    i.category.toLowerCase().includes(search.toLowerCase())
+  );
+  const urgent = filtered.filter(i => daysUntil(i.warrantyExpiration) <= 30);
+  const rest = filtered.filter(i => daysUntil(i.warrantyExpiration) > 30);
+
+  return (
+    <SafeAreaView style={s.safe}>
+      <StatusBar barStyle="dark-content" />
+      <View style={s.listHeader}>
+        <Text style={s.appTitle}>VaultKeep</Text>
+        <View style={{ flexDirection: 'row', gap: 10 }}>
+          <TouchableOpacity style={s.gearBtn} onPress={onSettings}>
+            <Text style={{ fontSize: 18 }}>⚙️</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={s.addBtn} onPress={onAdd}>
+            <Text style={s.addBtnText}>+</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+      <View style={s.searchWrap}>
+        <TextInput style={s.search} value={search} onChangeText={setSearch} placeholder="Search items..." placeholderTextColor={C.textFaint} />
+      </View>
+      <ScrollView contentContainerStyle={s.listContent}>
+        {urgent.length > 0 && (
+          <>
+            <Text style={s.sectionWarn}>⚠ Needs attention</Text>
+            {urgent.map(item => <ItemRow key={item.id} item={item} onPress={() => onSelect(item)} />)}
+          </>
+        )}
+        {rest.length > 0 && (
+          <>
+            <Text style={s.sectionLabel}>All items</Text>
+            {rest.map(item => <ItemRow key={item.id} item={item} onPress={() => onSelect(item)} />)}
+          </>
+        )}
+        {items.length === 0 && (
+          <View style={s.empty}>
+            <Text style={s.emptyIcon}>🗃</Text>
+            <Text style={s.emptyTitle}>No items yet</Text>
+            <Text style={s.emptySub}>Tap + to add your first warranty</Text>
+            <TouchableOpacity style={s.emptyBtn} onPress={onAdd}>
+              <Text style={s.emptyBtnText}>Add first item</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+function ItemRow({ item, onPress }) {
+  const days = daysUntil(item.warrantyExpiration);
+  const color = statusColor(days);
+  const docCount = (SAMPLE_DOCS[item.id] || []).length;
+  return (
+    <TouchableOpacity style={s.itemCard} onPress={onPress} activeOpacity={0.75}>
+      <View style={[s.dot, { backgroundColor: color }]} />
+      <View style={s.itemBody}>
+        <Text style={s.itemName} numberOfLines={1}>{item.name}</Text>
+        <Text style={s.itemMeta}>
+          {item.category}{item.retailer ? ` · ${item.retailer}` : ''}
+          {docCount > 0 ? `  · 📎 ${docCount}` : ''}
+        </Text>
+      </View>
+      <View style={s.itemRight}>
+        <Text style={[s.itemExpiry, { color }]}>{expiryLabel(days)}</Text>
+        {item.purchasePrice > 0 && <Text style={s.itemPrice}>${item.purchasePrice.toLocaleString()}</Text>}
+      </View>
+      <Text style={s.chevron}>›</Text>
+    </TouchableOpacity>
+  );
+}
+
+// ── DETAIL ────────────────────────────────────────────────
+
+function DetailScreen({ item, onBack, onEdit, onDelete, onDocs }) {
+  const days = daysUntil(item.warrantyExpiration);
+  const color = statusColor(days);
+  const docs = SAMPLE_DOCS[item.id] || [];
+
+  return (
+    <SafeAreaView style={s.safe}>
+      <View style={s.navBar}>
+        <TouchableOpacity onPress={onBack}><Text style={s.navBack}>‹ Back</Text></TouchableOpacity>
+        <TouchableOpacity onPress={onEdit}><Text style={s.navAction}>Edit</Text></TouchableOpacity>
+      </View>
+      <ScrollView contentContainerStyle={s.detailContent}>
+        <View style={s.heroCard}>
+          <Text style={s.heroName}>{item.name}</Text>
+          <Text style={s.heroCategory}>{item.category}</Text>
+          <View style={[s.statusPill, { backgroundColor: color + '18' }]}>
+            <View style={[s.dot, { backgroundColor: color }]} />
+            <Text style={[s.statusPillText, { color }]}>{expiryLabel(days)}</Text>
+          </View>
+        </View>
+
+        <View style={s.card}>
+          <Text style={s.cardTitle}>Purchase details</Text>
+          {item.retailer ? <Row label="Retailer" value={item.retailer} /> : null}
+          {item.purchasePrice > 0 ? <Row label="Price" value={`$${item.purchasePrice.toLocaleString()}`} /> : null}
+          <Row label="Purchased" value={formatDate(item.purchaseDate)} />
+          <Row label="Expires" value={formatDate(item.warrantyExpiration)} accent={days <= 30} />
+        </View>
+
+        {/* Documents card */}
+        <View style={s.card}>
+          <View style={s.cardTitleRow}>
+            <Text style={s.cardTitle}>Documents</Text>
+            <TouchableOpacity onPress={onDocs}>
+              <Text style={s.cardLink}>View all ›</Text>
+            </TouchableOpacity>
+          </View>
+          {docs.length === 0 ? (
+            <TouchableOpacity style={s.addDocRow} onPress={onDocs}>
+              <Text style={{ fontSize: 20, color: C.teal }}>+</Text>
+              <Text style={s.addDocText}>Add receipt, warranty card, or manual</Text>
+            </TouchableOpacity>
+          ) : (
+            <View style={s.docThumbRow}>
+              {docs.slice(0, 3).map(doc => {
+                const meta = DOC_ICONS[doc.type] || DOC_ICONS.receipt;
+                return (
+                  <TouchableOpacity key={doc.id} style={[s.docThumb, { backgroundColor: meta.color, borderColor: meta.border }]} onPress={onDocs}>
+                    <Text style={s.docThumbEmoji}>{meta.emoji}</Text>
+                    <Text style={s.docThumbLabel}>{meta.label}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+              <TouchableOpacity style={[s.docThumb, { backgroundColor: C.deep, borderColor: C.border, borderStyle: 'dashed' }]} onPress={onDocs}>
+                <Text style={{ fontSize: 20, color: C.textFaint }}>+</Text>
+                <Text style={s.docThumbLabel}>Add</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+        </View>
+
+        {item.contractorName ? (
+          <View style={s.card}>
+            <Text style={s.cardTitle}>Contractor</Text>
+            <Row label="Name" value={item.contractorName} />
+            {item.contractorPhone ? <Row label="Phone" value={item.contractorPhone} teal /> : null}
+            {item.contractorEmail ? <Row label="Email" value={item.contractorEmail} teal /> : null}
+          </View>
+        ) : null}
+
+        {item.notes ? (
+          <View style={s.card}>
+            <Text style={s.cardTitle}>Notes</Text>
+            <Text style={s.notesText}>{item.notes}</Text>
+          </View>
+        ) : null}
+
+        <TouchableOpacity style={s.deleteBtn} onPress={() => {
+          Alert.alert(`Delete ${item.name}?`, 'This cannot be undone.', [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Delete', style: 'destructive', onPress: onDelete },
+          ]);
+        }}>
+          <Text style={s.deleteBtnText}>Delete item</Text>
+        </TouchableOpacity>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+function Row({ label, value, accent, teal }) {
+  return (
+    <View style={s.row}>
+      <Text style={s.rowLabel}>{label}</Text>
+      <Text style={[s.rowValue, accent && { color: C.orange }, teal && { color: C.teal }]} numberOfLines={1}>{value}</Text>
+    </View>
+  );
+}
+
+
+// ── DOCUMENTS SCREEN ──────────────────────────────────────
+
+const STUB_PHOTO_COLORS = ['#E8F5E9','#E3F2FD','#FFF3E0','#F3E5F5','#FCE4EC','#E0F7FA'];
+
+function DocsScreen({ item, onBack, onExport }) {
+  const seedDocs = SAMPLE_DOCS[item.id] || [];
+  const [docs, setDocs] = useState(seedDocs);
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [pendingType, setPendingType] = useState(null);
+  const [showNameModal, setShowNameModal] = useState(false);
+  const [docName, setDocName] = useState('');
+
+  function openAdd(type) {
+    setPendingType(type);
+    setShowAddModal(false);
+    setDocName(DOC_ICONS[type]?.label ?? 'Document');
+    setShowNameModal(true);
+  }
+
+  function confirmAdd() {
+    if (!docName.trim()) return;
+    const meta = DOC_ICONS[pendingType] || DOC_ICONS.receipt;
+    const newDoc = {
+      id: String(Date.now()),
+      type: pendingType,
+      name: docName.trim(),
+      store: item.retailer || '',
+      date: new Date().toISOString().split('T')[0],
+      size: `${(Math.random() * 2 + 0.2).toFixed(1)} MB`,
+      stubColor: STUB_PHOTO_COLORS[Math.floor(Math.random() * STUB_PHOTO_COLORS.length)],
+    };
+    setDocs(prev => [...prev, newDoc]);
+    setShowNameModal(false);
+    setDocName('');
+    setPendingType(null);
+  }
+
+  function deleteDoc(id) {
+    Alert.alert('Remove document?', 'This cannot be undone.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Remove', style: 'destructive', onPress: () => setDocs(prev => prev.filter(d => d.id !== id)) },
+    ]);
+  }
+
+  return (
+    <SafeAreaView style={s.safe}>
+      <View style={s.navBar}>
+        <TouchableOpacity onPress={onBack}><Text style={s.navBack}>‹ Back</Text></TouchableOpacity>
+        <Text style={s.navTitle}>Documents</Text>
+        <TouchableOpacity onPress={() => setShowAddModal(true)}><Text style={s.navAction}>+ Add</Text></TouchableOpacity>
+      </View>
+      <ScrollView contentContainerStyle={s.detailContent}>
+
+        <View style={s.docItemBanner}>
+          <Text style={s.docItemBannerName}>{item.name}</Text>
+          <Text style={s.docItemBannerMeta}>{item.category} · {docs.length} document{docs.length !== 1 ? 's' : ''}</Text>
+        </View>
+
+        <View style={s.card}>
+          <Text style={s.cardTitle}>Everything you need</Text>
+          <Text style={s.docSubtitle}>Receipt, warranty card, and manual — all in one place.</Text>
+          {docs.length === 0 ? (
+            <TouchableOpacity style={s.docEmpty} onPress={() => setShowAddModal(true)}>
+              <Text style={{ fontSize: 36 }}>📂</Text>
+              <Text style={s.docEmptyText}>No documents yet</Text>
+              <Text style={s.docEmptySubText}>Tap + Add to attach a receipt, warranty, or manual</Text>
+            </TouchableOpacity>
+          ) : (
+            docs.map(doc => (
+              <DocRow key={doc.id} doc={doc} onDelete={() => deleteDoc(doc.id)} />
+            ))
+          )}
+        </View>
+
+        {/* Add type grid */}
+        <View style={s.card}>
+          <Text style={s.cardTitle}>Add a document</Text>
+          <View style={s.addDocGrid}>
+            {Object.entries(DOC_ICONS).map(([type, meta]) => (
+              <TouchableOpacity key={type} style={s.addDocTile} onPress={() => openAdd(type)}>
+                <View style={[s.addDocTileIcon, { backgroundColor: meta.color, borderColor: meta.border }]}>
+                  <Text style={{ fontSize: 24 }}>{meta.emoji}</Text>
+                </View>
+                <Text style={s.addDocTileLabel}>{meta.label}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </View>
+
+        {/* Export */}
+        <TouchableOpacity style={s.exportBtn} onPress={onExport}>
+          <Text style={{ fontSize: 28 }}>📤</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={s.exportBtnText}>Export as PDF</Text>
+            <Text style={s.exportBtnSub}>All details + documents in one file</Text>
+          </View>
+          <Text style={s.chevron}>›</Text>
+        </TouchableOpacity>
+
+      </ScrollView>
+
+      {/* Add method modal */}
+      <Modal visible={showAddModal} transparent animationType="slide">
+        <View style={s.modalBg}>
+          <View style={s.modalBox}>
+            <Text style={s.modalTitle}>Add document</Text>
+            {[
+              { label: '📷  Take photo', type: 'photo' },
+              { label: '🖼  Choose from library', type: 'photo' },
+              { label: '📄  Scan document', type: 'receipt' },
+              { label: '📥  Import PDF', type: 'manual' },
+            ].map(opt => (
+              <TouchableOpacity key={opt.label} style={s.modalOption} onPress={() => openAdd(opt.type)}>
+                <Text style={s.modalOptionText}>{opt.label}</Text>
+              </TouchableOpacity>
+            ))}
+            <TouchableOpacity style={s.modalCancel} onPress={() => setShowAddModal(false)}>
+              <Text style={{ color: C.red, fontSize: 16, textAlign: 'center' }}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Name document modal */}
+      <Modal visible={showNameModal} transparent animationType="fade">
+        <View style={[s.modalBg, { justifyContent: 'center', paddingHorizontal: 24 }]}>
+          <View style={[s.modalBox, { borderRadius: 16 }]}>
+            <Text style={s.modalTitle}>Name this document</Text>
+            <TextInput
+              style={[s.input, { marginBottom: 16 }]}
+              value={docName}
+              onChangeText={setDocName}
+              placeholder="e.g. Purchase Receipt"
+              placeholderTextColor={C.textFaint}
+              autoFocus
+            />
+            <TouchableOpacity style={s.unlockBtn} onPress={confirmAdd}>
+              <Text style={s.unlockBtnText}>Add document</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={s.modalCancel} onPress={() => { setShowNameModal(false); setDocName(''); }}>
+              <Text style={{ color: C.red, fontSize: 16, textAlign: 'center' }}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+    </SafeAreaView>
+  );
+}
+
+function DocRow({ doc, onDelete }) {
+  const meta = DOC_ICONS[doc.type] || DOC_ICONS.receipt;
+  return (
+    <TouchableOpacity style={s.docRow} activeOpacity={0.75} onLongPress={onDelete}
+      onPress={() => Alert.alert(doc.name, `${meta.label} · ${doc.size}\nAdded ${formatDate(doc.date)}\n\nFull document viewer available in the Xcode build.`)}>
+      <View style={[s.docRowIcon, { backgroundColor: doc.stubColor || meta.color, borderColor: meta.border }]}>
+        <Text style={{ fontSize: 22 }}>{meta.emoji}</Text>
+      </View>
+      <View style={s.docRowBody}>
+        <Text style={s.docRowName}>{doc.name}</Text>
+        <Text style={s.docRowMeta}>{meta.label} · {doc.size} · {formatDate(doc.date)}</Text>
+      </View>
+      <Text style={s.chevron}>›</Text>
+    </TouchableOpacity>
+  );
+}
+
+// ── PDF EXPORT SCREEN ─────────────────────────────────────
+
+function PDFExportScreen({ item, onBack }) {
+  const docs = SAMPLE_DOCS[item.id] || [];
+  const days = daysUntil(item.warrantyExpiration);
+  const [generating, setGenerating] = useState(false);
+  const [done, setDone] = useState(false);
+
+  function generate() {
+    setGenerating(true);
+    setTimeout(() => { setGenerating(false); setDone(true); }, 2000);
+  }
+
+  return (
+    <SafeAreaView style={s.safe}>
+      <View style={s.navBar}>
+        <TouchableOpacity onPress={onBack}><Text style={s.navBack}>‹ Back</Text></TouchableOpacity>
+        <Text style={s.navTitle}>Export PDF</Text>
+        <View style={{ width: 60 }} />
+      </View>
+      <ScrollView contentContainerStyle={s.detailContent}>
+
+        <View style={s.card}>
+          <Text style={s.cardTitle}>What's included</Text>
+          {[
+            ['✓', 'Item name, category, retailer'],
+            ['✓', 'Purchase date and price'],
+            ['✓', 'Warranty expiration date'],
+            ['✓', `Contractor details`],
+            ['✓', `${docs.length} attached document${docs.length !== 1 ? 's' : ''}`],
+            ['✓', 'Notes'],
+          ].map(([icon, label], i) => (
+            <View key={i} style={[s.row, { borderBottomWidth: i < 5 ? 0.5 : 0 }]}>
+              <Text style={{ color: C.teal, fontSize: 14, marginRight: 8 }}>{icon}</Text>
+              <Text style={[s.rowLabel, { color: C.text }]}>{label}</Text>
+            </View>
+          ))}
+        </View>
+
+        <View style={s.card}>
+          <Text style={s.cardTitle}>Preview</Text>
+          <View style={s.pdfPreview}>
+            <Text style={s.pdfPreviewTitle}>{item.name}</Text>
+            <Text style={s.pdfPreviewMeta}>{item.category} · {item.retailer}</Text>
+            <View style={s.pdfDivider} />
+            <View style={s.pdfRow}><Text style={s.pdfLabel}>Purchased</Text><Text style={s.pdfVal}>{formatDate(item.purchaseDate)}</Text></View>
+            <View style={s.pdfRow}><Text style={s.pdfLabel}>Price</Text><Text style={s.pdfVal}>${item.purchasePrice?.toLocaleString()}</Text></View>
+            <View style={s.pdfRow}><Text style={s.pdfLabel}>Expires</Text><Text style={[s.pdfVal, { color: statusColor(days) }]}>{formatDate(item.warrantyExpiration)}</Text></View>
+            {docs.length > 0 && <>
+              <View style={s.pdfDivider} />
+              <Text style={s.pdfLabel}>Attached documents</Text>
+              {docs.map(d => <Text key={d.id} style={s.pdfDoc}>· {d.name}</Text>)}
+            </>}
+          </View>
+        </View>
+
+        {done ? (
+          <View style={[s.card, { alignItems: 'center', gap: 8, paddingVertical: 24 }]}>
+            <Text style={{ fontSize: 40 }}>✅</Text>
+            <Text style={{ fontSize: 16, fontWeight: '600', color: C.text }}>PDF ready</Text>
+            <Text style={{ fontSize: 13, color: C.textSub }}>Full share sheet available in Xcode build</Text>
+          </View>
+        ) : (
+          <TouchableOpacity style={[s.unlockBtn, generating && { backgroundColor: C.textFaint }]} onPress={generate} disabled={generating}>
+            <Text style={s.unlockBtnText}>{generating ? 'Generating…' : 'Generate PDF'}</Text>
+          </TouchableOpacity>
+        )}
+
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+// ── ADD/EDIT ──────────────────────────────────────────────
+
+function AddEditScreen({ item, onSave, onCancel }) {
+  const isEdit = !!item;
+  const [name, setName] = useState(item?.name ?? '');
+  const [category, setCategory] = useState(item?.category ?? 'Appliance');
+  const [retailer, setRetailer] = useState(item?.retailer ?? '');
+  const [price, setPrice] = useState(item?.purchasePrice ? String(item.purchasePrice) : '');
+  const [expiry, setExpiry] = useState(item?.warrantyExpiration ?? new Date(Date.now() + 365 * 86400000).toISOString().split('T')[0]);
+  const [purchased, setPurchased] = useState(item?.purchaseDate ?? new Date().toISOString().split('T')[0]);
+  const [contractor, setContractor] = useState(item?.contractorName ?? '');
+  const [phone, setPhone] = useState(item?.contractorPhone ?? '');
+  const [email, setEmail] = useState(item?.contractorEmail ?? '');
+  const [notes, setNotes] = useState(item?.notes ?? '');
+  const [showCat, setShowCat] = useState(false);
+
+  function save() {
+    if (!name.trim()) { Alert.alert('Name required'); return; }
+    onSave({
+      id: item?.id ?? String(Date.now()),
+      name: name.trim(), category, retailer: retailer.trim(),
+      purchasePrice: parseFloat(price) || 0,
+      purchaseDate: purchased, warrantyExpiration: expiry,
+      contractorName: contractor.trim(), contractorPhone: phone.trim(),
+      contractorEmail: email.trim(), notes: notes.trim(),
+    });
+  }
+
+  return (
+    <SafeAreaView style={s.safe}>
+      <View style={s.navBar}>
+        <TouchableOpacity onPress={onCancel}><Text style={s.navBack}>Cancel</Text></TouchableOpacity>
+        <Text style={s.navTitle}>{isEdit ? 'Edit item' : 'Add item'}</Text>
+        <TouchableOpacity onPress={save}><Text style={s.navAction}>Save</Text></TouchableOpacity>
+      </View>
+      <ScrollView contentContainerStyle={s.formContent} keyboardShouldPersistTaps="handled">
+        <View style={s.formSection}>
+          <Text style={s.formSectionTitle}>Item</Text>
+          <F label="Name"><TextInput style={s.input} value={name} onChangeText={setName} placeholder="e.g. Samsung Washer WF45" placeholderTextColor={C.textFaint} /></F>
+          <F label="Category">
+            <TouchableOpacity style={s.input} onPress={() => setShowCat(true)}>
+              <Text style={s.inputText}>{category} ›</Text>
+            </TouchableOpacity>
+          </F>
+        </View>
+        <View style={s.formSection}>
+          <Text style={s.formSectionTitle}>Purchase</Text>
+          <F label="Retailer"><TextInput style={s.input} value={retailer} onChangeText={setRetailer} placeholder="Home Depot" placeholderTextColor={C.textFaint} /></F>
+          <F label="Price"><TextInput style={s.input} value={price} onChangeText={setPrice} placeholder="0.00" placeholderTextColor={C.textFaint} keyboardType="decimal-pad" /></F>
+          <F label="Purchase date (YYYY-MM-DD)"><TextInput style={s.input} value={purchased} onChangeText={setPurchased} placeholder="2024-01-01" placeholderTextColor={C.textFaint} /></F>
+          <F label="Warranty expires (YYYY-MM-DD)"><TextInput style={[s.input, { borderColor: C.teal }]} value={expiry} onChangeText={setExpiry} placeholder="2027-01-01" placeholderTextColor={C.textFaint} /></F>
+        </View>
+        <View style={s.formSection}>
+          <Text style={s.formSectionTitle}>Contractor (optional)</Text>
+          <F label="Name"><TextInput style={s.input} value={contractor} onChangeText={setContractor} placeholder="Jake's Appliance Repair" placeholderTextColor={C.textFaint} /></F>
+          <F label="Phone"><TextInput style={s.input} value={phone} onChangeText={setPhone} placeholder="(904) 555-0183" placeholderTextColor={C.textFaint} keyboardType="phone-pad" /></F>
+          <F label="Email"><TextInput style={s.input} value={email} onChangeText={setEmail} placeholder="contractor@email.com" placeholderTextColor={C.textFaint} keyboardType="email-address" autoCapitalize="none" /></F>
+        </View>
+        <View style={s.formSection}>
+          <Text style={s.formSectionTitle}>Notes</Text>
+          <TextInput style={[s.input, { minHeight: 80, textAlignVertical: 'top', paddingTop: 10 }]} value={notes} onChangeText={setNotes} placeholder="Additional notes..." placeholderTextColor={C.textFaint} multiline />
+        </View>
+      </ScrollView>
+      <Modal visible={showCat} transparent animationType="slide">
+        <View style={s.modalBg}>
+          <View style={s.modalBox}>
+            <Text style={s.modalTitle}>Category</Text>
+            {CATEGORIES.map(c => (
+              <TouchableOpacity key={c} style={s.modalOption} onPress={() => { setCategory(c); setShowCat(false); }}>
+                <Text style={[s.modalOptionText, c === category && { color: C.teal }]}>{c}</Text>
+              </TouchableOpacity>
+            ))}
+            <TouchableOpacity style={s.modalCancel} onPress={() => setShowCat(false)}>
+              <Text style={{ color: C.red, fontSize: 16, textAlign: 'center' }}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+    </SafeAreaView>
+  );
+}
+
+function F({ label, children }) {
+  return <View style={s.field}><Text style={s.fieldLabel}>{label}</Text>{children}</View>;
+}
+
+// ── PAYWALL ───────────────────────────────────────────────
+
+function PaywallScreen({ onClose, onUnlock }) {
+  return (
+    <SafeAreaView style={s.safe}>
+      <TouchableOpacity style={s.closeX} onPress={onClose}><Text style={{ color: C.textSub, fontSize: 18 }}>✕</Text></TouchableOpacity>
+      <ScrollView contentContainerStyle={s.paywallContent}>
+        <Text style={s.paywallIcon}>🔐</Text>
+        <Text style={s.paywallTitle}>Unlock VaultKeep</Text>
+        <Text style={s.paywallSub}>One-time purchase. No subscription. Yours forever.</Text>
+        {[
+          ['📦', 'Unlimited items — appliances, HVAC, electronics, and more'],
+          ['🔔', 'Expiration alerts — 30, 14, 7, and 1 day before expiry'],
+          ['📷', 'Attach receipts and PDF manuals to every item'],
+          ['📤', 'Export full inventory as PDF for insurance or home sale'],
+          ['📱', 'Offline first — your data stays on your device'],
+        ].map(([icon, text], i) => (
+          <View key={i} style={s.feature}>
+            <Text style={s.featureIcon}>{icon}</Text>
+            <Text style={s.featureText}>{text}</Text>
+          </View>
+        ))}
+        <TouchableOpacity style={s.unlockBtn} onPress={onUnlock}>
+          <Text style={s.unlockBtnText}>Unlock for $14.99</Text>
+          <Text style={s.unlockBtnSub}>One-time purchase</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={{ marginTop: 12 }} onPress={onClose}>
+          <Text style={{ color: C.textSub, textAlign: 'center', fontSize: 14 }}>Restore purchase</Text>
+        </TouchableOpacity>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+// ── ONBOARDING SCREEN ─────────────────────────────────────
+
+function OnboardingScreen({ onDone }) {
+  const [page, setPage] = useState(0);
+  const pages = [
+    { icon: '🗃', title: 'Never lose a warranty again', sub: 'Keep every appliance, HVAC unit, roof, and more organized in one place.' },
+    { icon: '⏰', title: 'Get alerts before they expire', sub: 'VaultKeep reminds you 30, 14, 7, and 1 day before a warranty runs out.' },
+    { icon: '📎', title: 'Attach receipts and manuals', sub: 'Snap a photo of your receipt or import a PDF — everything stays with the item.' },
+  ];
+  const current = pages[page];
+  return (
+    <SafeAreaView style={s.safe}>
+      <StatusBar barStyle="dark-content" />
+      <View style={s.onboardWrap}>
+        <View style={s.onboardCard}>
+          <Text style={s.onboardIcon}>{current.icon}</Text>
+          <Text style={s.onboardTitle}>{current.title}</Text>
+          <Text style={s.onboardSub}>{current.sub}</Text>
+        </View>
+        <View style={s.onboardDots}>
+          {pages.map((_, i) => (
+            <View key={i} style={[s.onboardDot, i === page && s.onboardDotActive]} />
+          ))}
+        </View>
+        {page < pages.length - 1 ? (
+          <TouchableOpacity style={s.unlockBtn} onPress={() => setPage(p => p + 1)}>
+            <Text style={s.unlockBtnText}>Next</Text>
+          </TouchableOpacity>
+        ) : (
+          <TouchableOpacity style={s.unlockBtn} onPress={onDone}>
+            <Text style={s.unlockBtnText}>Get started</Text>
+          </TouchableOpacity>
+        )}
+        {page < pages.length - 1 && (
+          <TouchableOpacity style={{ marginTop: 12 }} onPress={onDone}>
+            <Text style={{ color: C.textSub, textAlign: 'center', fontSize: 14 }}>Skip</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+    </SafeAreaView>
+  );
+}
+
+// ── SETTINGS SCREEN ───────────────────────────────────────
+
+function SettingsScreen({ onBack, unlocked, onRestore, onUnlock, onNotifications, itemCount }) {
+  return (
+    <SafeAreaView style={s.safe}>
+      <View style={s.navBar}>
+        <TouchableOpacity onPress={onBack}><Text style={s.navBack}>‹ Back</Text></TouchableOpacity>
+        <Text style={s.navTitle}>Settings</Text>
+        <View style={{ width: 60 }} />
+      </View>
+      <ScrollView contentContainerStyle={s.detailContent}>
+
+        {/* License status */}
+        <View style={s.card}>
+          <Text style={s.cardTitle}>License</Text>
+          <Row label="Status" value={unlocked ? '✓ Unlocked' : 'Free (1 item max)'} teal={unlocked} />
+          <Row label="Items stored" value={String(itemCount)} />
+          {!unlocked && (
+            <TouchableOpacity style={[s.unlockBtn, { marginTop: 8 }]} onPress={onUnlock}>
+              <Text style={s.unlockBtnText}>Unlock for $14.99</Text>
+            </TouchableOpacity>
+          )}
+          <TouchableOpacity style={s.restoreBtn} onPress={onRestore}>
+            <Text style={s.restoreBtnText}>Restore purchase</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Notifications */}
+        <View style={s.card}>
+          <Text style={s.cardTitle}>Notifications</Text>
+          <TouchableOpacity style={s.row} onPress={onNotifications}>
+            <Text style={[s.rowLabel, { color: C.text }]}>Expiry alert settings</Text>
+            <Text style={s.chevron}>›</Text>
+          </TouchableOpacity>
+          <Text style={s.settingsNote}>Set reminders at 30, 14, 7, and 1 day before expiry.</Text>
+        </View>
+
+        {/* Data */}
+        <View style={s.card}>
+          <Text style={s.cardTitle}>Data</Text>
+          <TouchableOpacity style={s.row} onPress={() => Alert.alert('Export', 'PDF export coming in next build.')}>
+            <Text style={[s.rowLabel, { color: C.text }]}>Export all as PDF</Text>
+            <Text style={s.chevron}>›</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={s.row} onPress={() => Alert.alert('Delete all data?', 'This cannot be undone.', [{ text: 'Cancel', style: 'cancel' }, { text: 'Delete', style: 'destructive' }])}>
+            <Text style={[s.rowLabel, { color: C.red }]}>Delete all data</Text>
+            <Text style={s.chevron}>›</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* About */}
+        <View style={s.card}>
+          <Text style={s.cardTitle}>About</Text>
+          <Row label="Version" value="1.0.0" />
+          <Row label="Build" value="1" />
+          <TouchableOpacity style={s.row}>
+            <Text style={[s.rowLabel, { color: C.teal }]}>Privacy Policy</Text>
+            <Text style={s.chevron}>›</Text>
+          </TouchableOpacity>
+        </View>
+
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+// ── NOTIFICATIONS SCREEN ──────────────────────────────────
+
+function NotificationsScreen({ onBack, alertPrefs, onPrefsChange, items }) {
+  const [alerts, setAlerts] = useState(alertPrefs);
+  const [permStatus, setPermStatus] = useState(null);
+
+  useEffect(() => {
+    Notifications.getPermissionsAsync().then(({ status }) => setPermStatus(status));
+  }, []);
+
+  async function toggle(key) {
+    const updated = { ...alerts, [key]: !alerts[key] };
+    setAlerts(updated);
+    onPrefsChange(updated);
+    // Reschedule all items with new prefs
+    await rescheduleAllAlerts(items, updated);
+  }
+
+  async function requestPerms() {
+    const { status: existing } = await Notifications.getPermissionsAsync();
+    if (existing === 'granted') {
+      setPermStatus('granted');
+      await rescheduleAllAlerts(items, alerts);
+      Alert.alert('Notifications enabled', "You'll get reminders before warranties expire.");
+      return;
+    }
+    const { status } = await Notifications.requestPermissionsAsync();
+    setPermStatus(status);
+    if (status === 'granted') {
+      await rescheduleAllAlerts(items, alerts);
+      Alert.alert('Notifications enabled', "You'll get reminders before warranties expire.");
+    } else {
+      Alert.alert(
+        'Notifications blocked',
+        'Enable notifications for VaultKeep in your device Settings to receive warranty reminders.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Open Settings', onPress: () => Linking.openSettings() },
+        ]
+      );
+    }
+  }
+
+  return (
+    <SafeAreaView style={s.safe}>
+      <View style={s.navBar}>
+        <TouchableOpacity onPress={onBack}><Text style={s.navBack}>‹ Back</Text></TouchableOpacity>
+        <Text style={s.navTitle}>Notifications</Text>
+        <View style={{ width: 60 }} />
+      </View>
+      <ScrollView contentContainerStyle={s.detailContent}>
+
+        {/* Permission banner */}
+        {permStatus !== 'granted' && (
+          <TouchableOpacity style={s.permBanner} onPress={requestPerms}>
+            <Text style={s.permBannerIcon}>🔔</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={s.permBannerTitle}>Enable notifications</Text>
+              <Text style={s.permBannerSub}>Tap to allow VaultKeep to send expiry reminders</Text>
+            </View>
+            <Text style={s.chevron}>›</Text>
+          </TouchableOpacity>
+        )}
+
+        <View style={s.card}>
+          <Text style={s.cardTitle}>Expiry alerts</Text>
+          <Text style={s.docSubtitle}>Get reminded before a warranty runs out. Fires at 9:00 AM.</Text>
+          {[
+            ['d30', '30 days before expiry'],
+            ['d14', '14 days before expiry'],
+            ['d7',  '7 days before expiry'],
+            ['d1',  '1 day before expiry'],
+          ].map(([key, label]) => (
+            <TouchableOpacity key={key} style={s.row} onPress={() => toggle(key)}>
+              <Text style={s.rowLabel}>{label}</Text>
+              <View style={[s.toggle, alerts[key] && s.toggleOn]}>
+                <View style={[s.toggleThumb, alerts[key] && s.toggleThumbOn]} />
+              </View>
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        <View style={s.card}>
+          <Text style={s.cardTitle}>Scheduled alerts</Text>
+          {items.length === 0 ? (
+            <Text style={s.docSubtitle}>No items yet — add items to see scheduled alerts here.</Text>
+          ) : (
+            items.map(item => {
+              const days = daysUntil(item.warrantyExpiration);
+              const upcoming = ALERT_DAYS.filter(d => d < days && alerts[`d${d}`]);
+              if (upcoming.length === 0) return null;
+              return (
+                <View key={item.id} style={[s.row, { flexDirection: 'column', alignItems: 'flex-start', gap: 2 }]}>
+                  <Text style={[s.rowLabel, { color: C.text, fontWeight: '600' }]}>{item.name}</Text>
+                  <Text style={s.docSubtitle}>
+                    Alerts at {upcoming.map(d => `${d}d`).join(', ')} before {formatDate(item.warrantyExpiration)}
+                  </Text>
+                </View>
+              );
+            })
+          )}
+        </View>
+
+        <Text style={s.settingsNote}>
+          {permStatus === 'granted'
+            ? '✓ Notifications are enabled. Alerts fire at 9:00 AM on each trigger day.'
+            : 'Notifications are not enabled. Tap the banner above to allow reminders.'}
+        </Text>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+// ── ROOT ─────────────────────────────────────────────────
+
+const STORAGE_KEYS = {
+  items: '@vaultkeep_items',
+  unlocked: '@vaultkeep_unlocked',
+  onboarded: '@vaultkeep_onboarded',
+  alertPrefs: '@vaultkeep_alertprefs',
+};
+
+const DEFAULT_ALERT_PREFS = { d30: true, d14: true, d7: true, d1: true };
+
+export default function App() {
+  const [items, setItems] = useState([]);
+  const [screen, setScreen] = useState('loading');
+  const [selected, setSelected] = useState(null);
+  const [editing, setEditing] = useState(null);
+  const [unlocked, setUnlocked] = useState(false);
+  const [alertPrefs, setAlertPrefs] = useState(DEFAULT_ALERT_PREFS);
+
+  // ── Load from storage on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const [storedItems, storedUnlocked, onboarded, storedPrefs] = await Promise.all([
+          AsyncStorage.getItem(STORAGE_KEYS.items),
+          AsyncStorage.getItem(STORAGE_KEYS.unlocked),
+          AsyncStorage.getItem(STORAGE_KEYS.onboarded),
+          AsyncStorage.getItem(STORAGE_KEYS.alertPrefs),
+        ]);
+        const loadedItems = storedItems ? JSON.parse(storedItems) : [];
+        const loadedPrefs = storedPrefs ? JSON.parse(storedPrefs) : DEFAULT_ALERT_PREFS;
+        setItems(loadedItems);
+        setAlertPrefs(loadedPrefs);
+        if (storedUnlocked === 'true') setUnlocked(true);
+        setScreen(onboarded ? 'list' : 'onboarding');
+        // Reschedule all on launch in case OS cleared them
+        await rescheduleAllAlerts(loadedItems, loadedPrefs);
+      } catch {
+        setScreen('list');
+      }
+    })();
+  }, []);
+
+  const persistItems = useCallback(async (newItems) => {
+    try { await AsyncStorage.setItem(STORAGE_KEYS.items, JSON.stringify(newItems)); } catch {}
+  }, []);
+
+  async function handleAlertPrefsChange(newPrefs) {
+    setAlertPrefs(newPrefs);
+    try { await AsyncStorage.setItem(STORAGE_KEYS.alertPrefs, JSON.stringify(newPrefs)); } catch {}
+  }
+
+  function handleAdd() {
+    if (unlocked || items.length < 1) { setEditing(null); setScreen('add'); }
+    else setScreen('paywall');
+  }
+
+  async function handleSave(item) {
+    let newItems;
+    if (editing) {
+      newItems = items.map(i => i.id === item.id ? item : i);
+      setSelected(item);
+      setScreen('detail');
+    } else {
+      newItems = [...items, item];
+      setScreen('list');
+    }
+    setItems(newItems);
+    persistItems(newItems);
+    setEditing(null);
+    // Schedule notifications for this item
+    await scheduleWarrantyAlerts(item, alertPrefs);
+  }
+
+  async function handleDelete() {
+    await cancelWarrantyAlerts(selected.id);
+    const newItems = items.filter(i => i.id !== selected.id);
+    setItems(newItems);
+    persistItems(newItems);
+    setSelected(null);
+    setScreen('list');
+  }
+
+  async function handleUnlock() {
+    setUnlocked(true);
+    try { await AsyncStorage.setItem(STORAGE_KEYS.unlocked, 'true'); } catch {}
+  }
+
+  async function handleOnboardDone() {
+    try { await AsyncStorage.setItem(STORAGE_KEYS.onboarded, 'true'); } catch {}
+    // Request notification permission during onboarding
+    await requestNotificationPermission();
+    setScreen('list');
+  }
+
+  if (screen === 'loading') return (
+    <SafeAreaView style={[s.safe, { alignItems: 'center', justifyContent: 'center' }]}>
+      <Text style={{ fontSize: 48 }}>🗃</Text>
+      <Text style={{ fontSize: 20, fontWeight: '700', color: C.text, marginTop: 12 }}>VaultKeep</Text>
+    </SafeAreaView>
+  );
+
+  if (screen === 'onboarding') return (
+    <OnboardingScreen onDone={handleOnboardDone} />
+  );
+
+  if (screen === 'paywall') return (
+    <PaywallScreen onClose={() => setScreen('list')} onUnlock={async () => { await handleUnlock(); setScreen('add'); }} />
+  );
+
+  if (screen === 'add') return (
+    <AddEditScreen item={editing} onSave={handleSave} onCancel={() => { setEditing(null); setScreen(editing ? 'detail' : 'list'); }} />
+  );
+
+  if (screen === 'docs' && selected) return (
+    <DocsScreen item={selected} onBack={() => setScreen('detail')} onExport={() => setScreen('pdf')} />
+  );
+
+  if (screen === 'pdf' && selected) return (
+    <PDFExportScreen item={selected} onBack={() => setScreen('docs')} />
+  );
+
+  if (screen === 'settings') return (
+    <SettingsScreen
+      onBack={() => setScreen('list')}
+      unlocked={unlocked}
+      itemCount={items.length}
+      onUnlock={() => setScreen('paywall')}
+      onNotifications={() => setScreen('notifications')}
+      onRestore={() => Alert.alert('Restore purchase', 'Checking your App Store purchases...', [{ text: 'OK' }])}
+    />
+  );
+
+  if (screen === 'notifications') return (
+    <NotificationsScreen
+      onBack={() => setScreen('settings')}
+      alertPrefs={alertPrefs}
+      onPrefsChange={handleAlertPrefsChange}
+      items={items}
+    />
+  );
+
+  if (screen === 'detail' && selected) return (
+    <DetailScreen
+      item={selected}
+      onBack={() => { setSelected(null); setScreen('list'); }}
+      onEdit={() => { setEditing(selected); setScreen('add'); }}
+      onDelete={handleDelete}
+      onDocs={() => setScreen('docs')}
+    />
+  );
+
+  return (
+    <ListScreen
+      items={items}
+      unlocked={unlocked}
+      onAdd={handleAdd}
+      onSettings={() => setScreen('settings')}
+      onSelect={item => { setSelected(item); setScreen('detail'); }}
+    />
+  );
+}
+
+// ── STYLES ───────────────────────────────────────────────
+
+const s = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: C.bg },
+  listHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 16, paddingTop: 16, paddingBottom: 8 },
+  appTitle: { fontSize: 28, fontWeight: '700', color: C.text },
+  addBtn: { width: 36, height: 36, borderRadius: 18, backgroundColor: C.teal, alignItems: 'center', justifyContent: 'center' },
+  addBtnText: { fontSize: 24, color: C.white, lineHeight: 30 },
+  searchWrap: { paddingHorizontal: 16, paddingBottom: 8 },
+  search: { backgroundColor: C.surface, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, color: C.text, fontSize: 15, borderWidth: 0.5, borderColor: C.border },
+  listContent: { paddingHorizontal: 16, paddingBottom: 40 },
+  sectionLabel: { fontSize: 11, fontWeight: '600', color: C.textSub, textTransform: 'uppercase', letterSpacing: 0.8, paddingVertical: 8 },
+  sectionWarn: { fontSize: 11, fontWeight: '600', color: C.orange, textTransform: 'uppercase', letterSpacing: 0.8, paddingVertical: 8 },
+  itemCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.surface, borderRadius: 10, padding: 12, marginBottom: 8, gap: 10, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.06, shadowRadius: 4, elevation: 2 },
+  dot: { width: 8, height: 8, borderRadius: 4, flexShrink: 0 },
+  itemBody: { flex: 1, gap: 2 },
+  itemName: { fontSize: 15, fontWeight: '600', color: C.text },
+  itemMeta: { fontSize: 11, color: C.textSub },
+  itemRight: { alignItems: 'flex-end', gap: 2 },
+  itemExpiry: { fontSize: 11, fontWeight: '600' },
+  itemPrice: { fontSize: 10, color: C.textFaint },
+  chevron: { color: C.textFaint, fontSize: 20 },
+  empty: { alignItems: 'center', paddingTop: 80, gap: 12 },
+  emptyIcon: { fontSize: 48 },
+  emptyTitle: { fontSize: 20, fontWeight: '600', color: C.text },
+  emptySub: { fontSize: 14, color: C.textSub, textAlign: 'center', paddingHorizontal: 32 },
+  emptyBtn: { marginTop: 16, backgroundColor: C.teal, paddingHorizontal: 24, paddingVertical: 12, borderRadius: 16 },
+  emptyBtnText: { fontSize: 15, fontWeight: '600', color: C.white },
+  navBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 12, backgroundColor: C.bg, borderBottomWidth: 0.5, borderBottomColor: C.border },
+  navBack: { color: C.teal, fontSize: 17 },
+  navTitle: { fontSize: 16, fontWeight: '600', color: C.text },
+  navAction: { color: C.teal, fontSize: 17, fontWeight: '600' },
+  detailContent: { paddingHorizontal: 16, paddingBottom: 40, gap: 12, paddingTop: 12 },
+  heroCard: { backgroundColor: C.surface, borderRadius: 16, padding: 20, gap: 8, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.06, shadowRadius: 4, elevation: 2 },
+  heroName: { fontSize: 22, fontWeight: '700', color: C.text },
+  heroCategory: { fontSize: 14, color: C.textSub },
+  statusPill: { flexDirection: 'row', alignItems: 'center', gap: 8, alignSelf: 'flex-start', paddingHorizontal: 12, paddingVertical: 4, borderRadius: 20, marginTop: 4 },
+  statusPillText: { fontSize: 13, fontWeight: '600' },
+  card: { backgroundColor: C.surface, borderRadius: 16, padding: 16, gap: 4, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.06, shadowRadius: 4, elevation: 2 },
+  cardTitle: { fontSize: 11, fontWeight: '600', color: C.textSub, textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 4 },
+  cardTitleRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 },
+  cardLink: { fontSize: 13, color: C.teal, fontWeight: '600' },
+  row: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 6, borderBottomWidth: 0.5, borderBottomColor: C.border },
+  rowLabel: { fontSize: 14, color: C.textSub, flex: 1 },
+  rowValue: { fontSize: 14, color: C.text, flex: 2, textAlign: 'right' },
+  notesText: { fontSize: 14, color: C.textSub, lineHeight: 20 },
+  deleteBtn: { backgroundColor: C.red + '12', borderRadius: 10, padding: 16, alignItems: 'center', borderWidth: 0.5, borderColor: C.red + '33', marginTop: 8 },
+  deleteBtnText: { color: C.red, fontSize: 16, fontWeight: '600' },
+  docThumbRow: { flexDirection: 'row', gap: 8, marginTop: 4, flexWrap: 'wrap' },
+  docThumb: { width: 64, height: 72, borderRadius: 10, borderWidth: 1, alignItems: 'center', justifyContent: 'center', gap: 4 },
+  docThumbEmoji: { fontSize: 24 },
+  docThumbLabel: { fontSize: 9, color: C.textSub, fontWeight: '500' },
+  addDocRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 12, borderRadius: 8, borderWidth: 1, borderColor: C.border, borderStyle: 'dashed', paddingHorizontal: 12, marginTop: 4 },
+  addDocText: { fontSize: 13, color: C.textSub },
+  docItemBanner: { backgroundColor: C.surface, borderRadius: 12, padding: 14, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 3, elevation: 1 },
+  docItemBannerName: { fontSize: 16, fontWeight: '600', color: C.text },
+  docItemBannerMeta: { fontSize: 12, color: C.textSub, marginTop: 2 },
+  docSubtitle: { fontSize: 13, color: C.textSub, lineHeight: 18, marginBottom: 8 },
+  docEmpty: { alignItems: 'center', paddingVertical: 24, gap: 6 },
+  docEmptyText: { fontSize: 15, fontWeight: '600', color: C.text },
+  docEmptySubText: { fontSize: 13, color: C.textSub },
+  docRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 0.5, borderBottomColor: C.border, gap: 12 },
+  docRowIcon: { width: 44, height: 44, borderRadius: 10, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
+  docRowBody: { flex: 1 },
+  docRowName: { fontSize: 14, fontWeight: '600', color: C.text },
+  docRowMeta: { fontSize: 11, color: C.textSub, marginTop: 2 },
+  addDocGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 12, marginTop: 4 },
+  addDocTile: { alignItems: 'center', gap: 6, width: '22%' },
+  addDocTileIcon: { width: 52, height: 52, borderRadius: 12, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
+  addDocTileLabel: { fontSize: 11, color: C.textSub, fontWeight: '500' },
+  exportBtn: { flexDirection: 'row', alignItems: 'center', gap: 14, backgroundColor: C.surface, borderRadius: 14, padding: 16, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.06, shadowRadius: 4, elevation: 2 },
+  exportBtnText: { fontSize: 15, fontWeight: '600', color: C.text },
+  exportBtnSub: { fontSize: 12, color: C.textSub, marginTop: 2 },
+  formContent: { padding: 16, gap: 12, paddingBottom: 60 },
+  formSection: { backgroundColor: C.surface, borderRadius: 16, padding: 16, gap: 10, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 3, elevation: 1 },
+  formSectionTitle: { fontSize: 11, fontWeight: '600', color: C.textSub, textTransform: 'uppercase', letterSpacing: 0.8 },
+  field: { gap: 4 },
+  fieldLabel: { fontSize: 11, color: C.textSub },
+  input: { backgroundColor: C.deep, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 9, color: C.text, fontSize: 15, borderWidth: 0.5, borderColor: C.border },
+  inputText: { color: C.text, fontSize: 15 },
+  modalBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.3)', justifyContent: 'flex-end' },
+  modalBox: { backgroundColor: C.surface, borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 24, gap: 4 },
+  modalTitle: { fontSize: 16, fontWeight: '600', color: C.text, marginBottom: 12 },
+  modalOption: { paddingVertical: 12, borderBottomWidth: 0.5, borderBottomColor: C.border },
+  modalOptionText: { fontSize: 15, color: C.text },
+  modalCancel: { marginTop: 12, paddingVertical: 12 },
+  paywallContent: { padding: 24, alignItems: 'center', paddingTop: 60, gap: 12 },
+  paywallIcon: { fontSize: 64 },
+  paywallTitle: { fontSize: 28, fontWeight: '700', color: C.text, textAlign: 'center' },
+  paywallSub: { fontSize: 15, color: C.textSub, textAlign: 'center', lineHeight: 22 },
+  feature: { flexDirection: 'row', alignItems: 'flex-start', gap: 12, alignSelf: 'stretch' },
+  featureIcon: { fontSize: 20, width: 28 },
+  featureText: { fontSize: 14, color: C.text, flex: 1, lineHeight: 20 },
+  unlockBtn: { backgroundColor: C.teal, borderRadius: 16, paddingVertical: 16, paddingHorizontal: 32, alignItems: 'center', marginTop: 12, alignSelf: 'stretch' },
+  unlockBtnText: { fontSize: 17, fontWeight: '600', color: C.white },
+  unlockBtnSub: { fontSize: 12, color: 'rgba(255,255,255,0.7)', marginTop: 2 },
+  closeX: { position: 'absolute', top: 56, right: 16, zIndex: 10, width: 32, height: 32, borderRadius: 16, backgroundColor: C.deep, alignItems: 'center', justifyContent: 'center' },
+  gearBtn: { width: 36, height: 36, borderRadius: 18, backgroundColor: C.deep, alignItems: 'center', justifyContent: 'center' },
+  onboardWrap: { flex: 1, padding: 24, justifyContent: 'center', alignItems: 'center', gap: 24 },
+  onboardCard: { backgroundColor: C.surface, borderRadius: 24, padding: 32, alignItems: 'center', gap: 16, width: '100%', shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.08, shadowRadius: 8, elevation: 3 },
+  onboardIcon: { fontSize: 72 },
+  onboardTitle: { fontSize: 24, fontWeight: '700', color: C.text, textAlign: 'center' },
+  onboardSub: { fontSize: 15, color: C.textSub, textAlign: 'center', lineHeight: 22 },
+  onboardDots: { flexDirection: 'row', gap: 8 },
+  onboardDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: C.border },
+  onboardDotActive: { backgroundColor: C.teal, width: 20 },
+  restoreBtn: { marginTop: 8, paddingVertical: 10, alignItems: 'center' },
+  restoreBtnText: { color: C.teal, fontSize: 15 },
+  settingsNote: { fontSize: 12, color: C.textFaint, textAlign: 'center', paddingHorizontal: 16, lineHeight: 18 },
+  toggle: { width: 44, height: 26, borderRadius: 13, backgroundColor: C.border, justifyContent: 'center', paddingHorizontal: 2 },
+  toggleOn: { backgroundColor: C.teal },
+  toggleThumb: { width: 22, height: 22, borderRadius: 11, backgroundColor: C.white, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.15, shadowRadius: 2 },
+  toggleThumbOn: { transform: [{ translateX: 18 }] },
+  pdfPreview: { backgroundColor: C.deep, borderRadius: 10, padding: 16, marginTop: 4 },
+  pdfPreviewTitle: { fontSize: 16, fontWeight: '700', color: C.text },
+  pdfPreviewMeta: { fontSize: 12, color: C.textSub, marginBottom: 8 },
+  pdfDivider: { height: 0.5, backgroundColor: C.border, marginVertical: 8 },
+  pdfRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 3 },
+  pdfLabel: { fontSize: 12, color: C.textSub },
+  pdfVal: { fontSize: 12, color: C.text, fontWeight: '500' },
+  pdfDoc: { fontSize: 11, color: C.textSub, marginTop: 2 },
+  permBanner: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: C.teal + '15', borderRadius: 12, padding: 14, borderWidth: 1, borderColor: C.teal + '40' },
+  permBannerIcon: { fontSize: 24 },
+  permBannerTitle: { fontSize: 14, fontWeight: '600', color: C.text },
+  permBannerSub: { fontSize: 12, color: C.textSub, marginTop: 2 },
+});{
   "expo": {
     "name": "VaultKeep",
     "slug": "vaultkeep",
